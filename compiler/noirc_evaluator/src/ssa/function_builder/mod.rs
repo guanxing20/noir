@@ -247,7 +247,7 @@ impl FunctionBuilder {
         self.current_block
     }
 
-    pub fn get_current_block_index(&mut self) -> BasicBlockId {
+    pub fn get_current_block_index(&self) -> BasicBlockId {
         self.current_block
     }
 
@@ -440,6 +440,12 @@ impl FunctionBuilder {
     pub fn terminate_with_return(&mut self, return_values: Vec<ValueId>) {
         let call_stack = self.call_stack;
         self.terminate_block_with(TerminatorInstruction::Return { return_values, call_stack });
+    }
+
+    /// Terminate the current block with an unreachable instruction
+    pub fn terminate_with_unreachable(&mut self) {
+        let call_stack = self.call_stack;
+        self.terminate_block_with(TerminatorInstruction::Unreachable { call_stack });
     }
 
     /// Returns a ValueId pointing to the given function or imports the function

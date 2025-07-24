@@ -85,12 +85,13 @@ use crate::ssa::{
     ir::{
         basic_block::BasicBlockId,
         cfg::ControlFlowGraph,
+        dfg::InsertInstructionResult,
         function::Function,
         function_inserter::FunctionInserter,
         instruction::{Instruction, InstructionId, TerminatorInstruction},
         post_order::PostOrder,
         types::Type,
-        value::ValueId,
+        value::{Value, ValueId},
     },
     ssa_gen::Ssa,
 };
@@ -180,12 +181,29 @@ impl<'f> PerFunctionContext<'f> {
 
         let mut all_terminator_values = HashSet::default();
         let mut per_func_block_params: HashSet<ValueId> = HashSet::default();
-        for (block_id, _) in self.blocks.iter() {
+        for (block_id, references) in self.blocks.iter_mut() {
             let block_params = self.inserter.function.dfg.block_parameters(*block_id);
             per_func_block_params.extend(block_params.iter());
             let terminator = self.inserter.function.dfg[*block_id].unwrap_terminator();
-            terminator.for_each_value(|value| all_terminator_values.insert(value));
+            terminator.for_each_value(|value| {
+                all_terminator_values.insert(value);
+                // Also insert all the aliases of this value as being used in the terminator,
+                // so that for example if the value is an array and contains a reference,
+                // then that reference gets to keep its last store.
+                let typ = self.inserter.function.dfg.type_of_value(value);
+                if Self::contains_references(&typ) {
+                    if let Some(expression) = references.expressions.get(&value) {
+                        if let Some(aliases) = references.aliases.get(expression) {
+                            aliases.for_each(|alias| {
+                                all_terminator_values.insert(alias);
+                            });
+                        }
+                    }
+                }
+            });
         }
+
+        // Add all the aliases of values used in the terminators.
 
         // If we never load from an address within a function we can remove all stores to that address.
         // This rule does not apply to reference parameters, which we must also check for before removing these stores.
@@ -240,12 +258,14 @@ impl<'f> PerFunctionContext<'f> {
                     return true;
                 }
 
+                // Is any alias of this address an input to some function call, or a return value?
                 let allocation_aliases_instr_input =
                     aliases.any(|alias| self.instruction_input_references.contains(&alias));
                 if allocation_aliases_instr_input == Some(true) {
                     return true;
                 }
 
+                // Is any alias of this address used in a block terminator?
                 let allocation_aliases_terminator_args =
                     aliases.any(|alias| all_terminator_values.contains(&alias));
                 if allocation_aliases_terminator_args == Some(true) {
@@ -401,18 +421,37 @@ impl<'f> PerFunctionContext<'f> {
         &mut self,
         block_id: BasicBlockId,
         references: &mut Block,
-        mut instruction: InstructionId,
+        instruction: InstructionId,
     ) {
-        // If the instruction was simplified and optimized out of the program we shouldn't analyze
-        // it. Analyzing it could make tracking aliases less accurate if it is e.g. an ArrayGet
+        // If the instruction was simplified and optimized out of the program we shouldn't analyze it.
+        // Analyzing it could make tracking aliases less accurate if it is e.g. an ArrayGet
         // call that used to hold references but has since been optimized out to a known result.
-        if let Some(new_id) = self.inserter.push_instruction(instruction, block_id) {
-            instruction = new_id;
-        } else {
+        // However, if we don't analyze it, then it may be a MakeArray replacing an ArraySet containing references,
+        // and we need to mark those references as used to keep their stores alive.
+        let (instruction, simplified) = {
+            let (ins, loc) = self.inserter.map_instruction(instruction);
+            match self.inserter.push_instruction_value(ins, instruction, block_id, loc) {
+                InsertInstructionResult::Results(id, _) => (id, false),
+                InsertInstructionResult::SimplifiedTo(value) => {
+                    let value = &self.inserter.function.dfg[value];
+                    let Value::Instruction { instruction, .. } = value else {
+                        return;
+                    };
+                    (*instruction, true)
+                }
+                _ => return,
+            }
+        };
+
+        let ins = &self.inserter.function.dfg[instruction];
+
+        // Some instructions, when simplified, cause problems if processed again.
+        // We do need it for MakeArray in some cases, and at the moment that is not problematic.
+        if simplified && !matches!(ins, Instruction::MakeArray { .. }) {
             return;
         }
 
-        match &self.inserter.function.dfg[instruction] {
+        match ins {
             Instruction::Load { address } => {
                 let address = *address;
 
@@ -458,10 +497,14 @@ impl<'f> PerFunctionContext<'f> {
 
                 // If there was another store to this instruction without any (unremoved) loads or
                 // function calls in-between, we can remove the previous store.
-                if let Some(last_store) = references.last_stores.get(&address) {
-                    self.instructions_to_remove.insert(*last_store);
+                if !self.aliased_references.contains_key(&address) {
+                    if let Some(last_store) = references.last_stores.get(&address) {
+                        self.instructions_to_remove.insert(*last_store);
+                    }
                 }
 
+                // Remember that we used the value in this instruction. If this instruction
+                // isn't removed at the end, we need to keep the stores to the value as well.
                 references.for_each_alias_of(value, |_, alias| {
                     self.aliased_references.entry(alias).or_default().insert(instruction);
                 });
@@ -522,6 +565,13 @@ impl<'f> PerFunctionContext<'f> {
 
                     references.expressions.insert(result, expression.clone());
                     references.aliases.insert(expression, aliases);
+
+                    // Similar to how we remember that we used a value in a `Store` instruction,
+                    // take note that it was used in the `ArraySet`. If this instruction is not
+                    // going to be removed at the end, we shall keep the stores to this value as well.
+                    references.for_each_alias_of(*value, |_, alias| {
+                        self.aliased_references.entry(alias).or_default().insert(instruction);
+                    });
                 }
             }
             Instruction::Call { arguments, .. } => {
@@ -617,7 +667,7 @@ impl<'f> PerFunctionContext<'f> {
         self.inserter.map_terminator_in_place(block);
 
         match self.inserter.function.dfg[block].unwrap_terminator() {
-            TerminatorInstruction::JmpIf { .. } => (), // Nothing to do
+            TerminatorInstruction::JmpIf { .. } | TerminatorInstruction::Unreachable { .. } => (), // Nothing to do
             TerminatorInstruction::Jmp { destination, arguments, .. } => {
                 let destination_parameters = self.inserter.function.dfg[*destination].parameters();
                 assert_eq!(destination_parameters.len(), arguments.len());
@@ -940,9 +990,7 @@ mod tests {
         // The first store is not removed as it is used as a nested reference in another store.
         // We would need to track whether the store where `v0` is the store value gets removed to know whether
         // to remove it.
-        // The first store in b1 is removed since there is another store to the same reference
-        // in the same block, and the store is not needed before the later store.
-        // The rest of the stores are also removed as no loads are done within any blocks
+        // The final store in b1 is removed as no loads are done within any blocks
         // to the stored values.
         let expected = "
         acir(inline) fn main f0 {
@@ -952,6 +1000,7 @@ mod tests {
             v2 = allocate -> &mut &mut Field
             jmp b1()
           b1():
+            store Field 1 at v0
             return
         }
         ";
@@ -1513,6 +1562,40 @@ mod tests {
           b6(v1: u1):
             return v1
         }
+        ";
+        let ssa = Ssa::from_str(src).unwrap();
+        let ssa = ssa.mem2reg();
+        assert_normalized_ssa_equals(ssa, src);
+    }
+
+    #[test]
+    fn keep_last_stores_with_aliased_references() {
+        // Ensure `store v8 at v1` is not removed from the program
+        // just because there is a subsequent `store v10 at v1`.
+        // In this case `v1` is aliased to `*v3` so the store is significant.
+        let src = "
+            acir(inline) fn main f0 {
+              b0():
+                v1 = allocate -> &mut Field
+                store Field 0 at v1
+                v3 = allocate -> &mut &mut Field
+                store v1 at v3
+                jmp b1(u32 10)
+              b1(v0: u32):
+                v6 = lt v0, u32 11
+                jmpif v6 then: b2, else: b3
+              b2():
+                v8 = cast v0 as Field
+                store v8 at v1
+                v9 = load v3 -> &mut Field
+                v10 = load v9 -> Field
+                store v10 at v1
+                v12 = unchecked_add v0, u32 1
+                jmp b1(v12)
+              b3():
+                v7 = load v1 -> Field
+                return v7
+            }
         ";
         let ssa = Ssa::from_str(src).unwrap();
         let ssa = ssa.mem2reg();

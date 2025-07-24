@@ -200,7 +200,7 @@ impl Translator {
 
     /// Computes the order in which blocks should be translated. The order will be according
     /// to the block terminators, starting from the entry block. This is needed because a variable
-    /// in a block might refer to a variable that syntantically happens afterwards, but logically
+    /// in a block might refer to a variable that syntactically happens afterwards, but logically
     /// happens before.
     fn compute_blocks_order(
         &self,
@@ -229,7 +229,7 @@ impl Translator {
                     queue.push_back(self.lookup_block(then_block)?);
                     queue.push_back(self.lookup_block(else_block)?);
                 }
-                ParsedTerminator::Return(..) => (),
+                ParsedTerminator::Return(..) | ParsedTerminator::Unreachable => (),
             }
         }
 
@@ -264,6 +264,9 @@ impl Translator {
             ParsedTerminator::Return(values) => {
                 let return_values = self.translate_values(values)?;
                 self.builder.terminate_with_return(return_values);
+            }
+            ParsedTerminator::Unreachable => {
+                self.builder.terminate_with_unreachable();
             }
         }
 

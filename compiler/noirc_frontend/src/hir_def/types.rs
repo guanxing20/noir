@@ -9,10 +9,14 @@ use acvm::{AcirField, FieldElement};
 
 use crate::{
     ast::{IntegerBitSize, ItemVisibility},
-    hir::type_check::{TypeCheckError, generics::TraitGenerics},
+    hir::{
+        def_map::ModuleId,
+        type_check::{TypeCheckError, generics::TraitGenerics},
+    },
     hir_def::types::{self},
-    node_interner::{NodeInterner, TraitId, TypeAliasId},
+    node_interner::{NodeInterner, TraitAssociatedTypeId, TraitId, TypeAliasId},
     signed_field::{AbsU128, SignedField},
+    token::IntegerTypeSuffix,
 };
 use iter_extended::vecmap;
 use noirc_errors::Location;
@@ -263,6 +267,15 @@ impl Kind {
             }),
         }
     }
+
+    /// Return the corresponding IntegerTypeSuffix if this is a numeric type kind.
+    /// Note that `Kind::IntegerOrField` and `Kind::Integer` resolve to types and are thus not numeric.
+    pub(crate) fn as_integer_type_suffix(&self) -> Option<IntegerTypeSuffix> {
+        match self {
+            Kind::Numeric(typ) => typ.as_integer_type_suffix(),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Kind {
@@ -272,7 +285,7 @@ impl std::fmt::Display for Kind {
             Kind::Normal => write!(f, "normal"),
             Kind::Integer => write!(f, "int"),
             Kind::IntegerOrField => write!(f, "intOrField"),
-            Kind::Numeric(typ) => write!(f, "numeric {}", typ),
+            Kind::Numeric(typ) => write!(f, "numeric {typ}"),
         }
     }
 }
@@ -299,6 +312,26 @@ pub enum QuotedType {
 /// TypeVariable in addition to the matching TypeVariableId allows
 /// the binding to later be undone if needed.
 pub type TypeBindings = HashMap<TypeVariableId, (TypeVariable, Kind, Type)>;
+
+/// Pretty print type bindings for debugging
+#[allow(unused)]
+pub fn type_bindings_to_string(bindings: &TypeBindings) -> String {
+    if bindings.is_empty() {
+        return "bindings: (none)".to_string();
+    }
+
+    let mut ret = if bindings.len() == 1 {
+        "1 binding:".to_string()
+    } else {
+        format!("{} bindings:", bindings.len())
+    };
+
+    for (var, _, binding) in bindings.values() {
+        ret += &format!("\n    {var:?} := {binding:?}");
+    }
+
+    ret
+}
 
 /// Represents a struct or enum type in the type system. Each instance of this
 /// rust struct will be shared across all Type::DataType variants that represent
@@ -660,6 +693,7 @@ pub struct TypeAlias {
     pub generics: Generics,
     pub visibility: ItemVisibility,
     pub location: Location,
+    pub module_id: ModuleId,
 }
 
 impl std::hash::Hash for TypeAlias {
@@ -700,8 +734,9 @@ impl TypeAlias {
         typ: Type,
         generics: Generics,
         visibility: ItemVisibility,
+        module_id: ModuleId,
     ) -> TypeAlias {
-        TypeAlias { id, typ, name, location, generics, visibility }
+        TypeAlias { id, typ, name, location, generics, visibility, module_id }
     }
 
     pub fn set_type_and_generics(&mut self, new_typ: Type, new_generics: Generics) {
@@ -729,6 +764,13 @@ impl TypeAlias {
         let args = vecmap(&self.generics, |_| interner.next_type_variable());
         self.get_type(&args)
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct TraitAssociatedType {
+    pub id: TraitAssociatedTypeId,
+    pub trait_id: TraitId,
+    pub name: Ident,
 }
 
 /// A shared, mutable reference to some T.
@@ -912,6 +954,26 @@ impl TypeVariable {
         }
     }
 
+    /// Check that if bound, it's a signed integer
+    pub fn is_signed(&self) -> bool {
+        match &*self.borrow() {
+            TypeBinding::Bound(binding) => {
+                matches!(binding.follow_bindings(), Type::Integer(Signedness::Signed, _))
+            }
+            _ => false,
+        }
+    }
+
+    /// Check that if bound, it's an unsigned integer
+    pub fn is_unsigned(&self) -> bool {
+        match &*self.borrow() {
+            TypeBinding::Bound(binding) => {
+                matches!(binding.follow_bindings(), Type::Integer(Signedness::Unsigned, _))
+            }
+            _ => false,
+        }
+    }
+
     /// If value_level, only check for Type::FieldElement,
     /// else only check for a type-level FieldElement
     fn is_field_element(&self, value_level: bool) -> bool {
@@ -924,7 +986,7 @@ impl TypeVariable {
 
 /// TypeBindings are the mutable insides of a TypeVariable.
 /// They are either bound to some type, or are unbound.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum TypeBinding {
     Bound(Type),
     Unbound(TypeVariableId, Kind),
@@ -966,7 +1028,7 @@ impl std::fmt::Display for Type {
                         Kind::Numeric(_typ) => write!(f, "_"),
                     },
                     TypeBinding::Bound(binding) => {
-                        write!(f, "{}", binding)
+                        write!(f, "{binding}")
                     }
                 }
             }
@@ -987,7 +1049,7 @@ impl std::fmt::Display for Type {
                 }
             }
             Type::TraitAsType(_id, name, generics) => {
-                write!(f, "impl {}{}", name, generics)
+                write!(f, "impl {name}{generics}")
             }
             Type::Tuple(elements) => {
                 let elements = vecmap(elements, ToString::to_string);
@@ -1035,9 +1097,9 @@ impl std::fmt::Display for Type {
             Type::Reference(element, _) => {
                 write!(f, "&{element}")
             }
-            Type::Quoted(quoted) => write!(f, "{}", quoted),
+            Type::Quoted(quoted) => write!(f, "{quoted}"),
             Type::InfixExpr(lhs, op, rhs, _) => {
-                let this = self.canonicalize_checked();
+                let this = self.canonicalize_checked(&TypeBindings::default());
 
                 // Prevent infinite recursion
                 if this != *self { write!(f, "{this}") } else { write!(f, "({lhs} {op} {rhs})") }
@@ -1065,6 +1127,15 @@ impl std::fmt::Display for TypeVariableId {
 }
 
 impl std::fmt::Display for TypeBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TypeBinding::Bound(typ) => typ.fmt(f),
+            TypeBinding::Unbound(id, _) => id.fmt(f),
+        }
+    }
+}
+
+impl std::fmt::Debug for TypeBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TypeBinding::Bound(typ) => typ.fmt(f),
@@ -1162,11 +1233,19 @@ impl Type {
     }
 
     pub fn is_signed(&self) -> bool {
-        matches!(self.follow_bindings(), Type::Integer(Signedness::Signed, _))
+        match self.follow_bindings_shallow().as_ref() {
+            Type::Integer(Signedness::Signed, _) => true,
+            Type::TypeVariable(var) => var.is_signed(),
+            _ => false,
+        }
     }
 
     pub fn is_unsigned(&self) -> bool {
-        matches!(self.follow_bindings(), Type::Integer(Signedness::Unsigned, _))
+        match self.follow_bindings_shallow().as_ref() {
+            Type::Integer(Signedness::Unsigned, _) => true,
+            Type::TypeVariable(var) => var.is_unsigned(),
+            _ => false,
+        }
     }
 
     /// While Kind::is_numeric refers to numeric _types_,
@@ -1771,11 +1850,13 @@ impl Type {
     /// If this type is a Type::Constant (used in array lengths), or is bound
     /// to a Type::Constant, return the constant as a u32.
     pub fn evaluate_to_u32(&self, location: Location) -> Result<u32, TypeCheckError> {
-        self.evaluate_to_field_element(&Kind::u32(), location).map(|field_element| {
-            field_element
-                .try_to_u32()
-                .expect("ICE: size should have already been checked by evaluate_to_field_element")
-        })
+        self.evaluate_to_field_element(&Kind::u32(), &TypeBindings::default(), location).map(
+            |field_element| {
+                field_element.try_to_u32().expect(
+                    "ICE: size should have already been checked by evaluate_to_field_element",
+                )
+            },
+        )
     }
 
     // TODO(https://github.com/noir-lang/noir/issues/6260): remove
@@ -1783,10 +1864,11 @@ impl Type {
     pub(crate) fn evaluate_to_field_element(
         &self,
         kind: &Kind,
+        bindings: &TypeBindings,
         location: Location,
     ) -> Result<acvm::FieldElement, TypeCheckError> {
         let run_simplifications = true;
-        self.evaluate_to_field_element_helper(kind, location, run_simplifications)
+        self.evaluate_to_field_element_helper(kind, location, bindings, run_simplifications)
     }
 
     /// evaluate_to_field_element with optional generic arithmetic simplifications
@@ -1794,21 +1876,37 @@ impl Type {
         &self,
         kind: &Kind,
         location: Location,
+        bindings: &TypeBindings,
         run_simplifications: bool,
     ) -> Result<acvm::FieldElement, TypeCheckError> {
         if let Some((binding, binding_kind)) = self.get_inner_type_variable() {
-            if let TypeBinding::Bound(binding) = &*binding.borrow() {
-                if kind.unifies(&binding_kind) {
-                    return binding.evaluate_to_field_element_helper(
-                        &binding_kind,
-                        location,
-                        run_simplifications,
-                    );
+            match &*binding.borrow() {
+                TypeBinding::Bound(binding) => {
+                    if kind.unifies(&binding_kind) {
+                        return binding.evaluate_to_field_element_helper(
+                            &binding_kind,
+                            location,
+                            bindings,
+                            run_simplifications,
+                        );
+                    }
+                }
+                TypeBinding::Unbound(type_variable_id, kind) => {
+                    if kind.unifies(&binding_kind) {
+                        if let Some((_, _, typ)) = bindings.get(type_variable_id) {
+                            return typ.evaluate_to_field_element_helper(
+                                &binding_kind,
+                                location,
+                                bindings,
+                                run_simplifications,
+                            );
+                        }
+                    }
                 }
             }
         }
 
-        match self.canonicalize_with_simplifications(run_simplifications) {
+        match self.canonicalize_with_simplifications(bindings, run_simplifications) {
             Type::Constant(x, constant_kind) => {
                 if kind.unifies(&constant_kind) {
                     kind.ensure_value_fits(x, location)
@@ -1826,11 +1924,13 @@ impl Type {
                     let lhs_value = lhs.evaluate_to_field_element_helper(
                         &infix_kind,
                         location,
+                        bindings,
                         run_simplifications,
                     )?;
                     let rhs_value = rhs.evaluate_to_field_element_helper(
                         &infix_kind,
                         location,
+                        bindings,
                         run_simplifications,
                     )?;
                     op.function(lhs_value, rhs_value, &infix_kind, location)
@@ -1843,14 +1943,17 @@ impl Type {
                 }
             }
             Type::CheckedCast { from, to } => {
-                let to_value = to.evaluate_to_field_element(kind, location)?;
+                let to_value = to.evaluate_to_field_element(kind, bindings, location)?;
 
                 // if both 'to' and 'from' evaluate to a constant,
                 // return None unless they match
                 let skip_simplifications = false;
-                if let Ok(from_value) =
-                    from.evaluate_to_field_element_helper(kind, location, skip_simplifications)
-                {
+                if let Ok(from_value) = from.evaluate_to_field_element_helper(
+                    kind,
+                    location,
+                    bindings,
+                    skip_simplifications,
+                ) {
                     if to_value == from_value {
                         Ok(to_value)
                     } else {
@@ -1944,28 +2047,34 @@ impl Type {
     /// is used and generic substitutions are provided manually by users.
     ///
     /// Expects the given type vector to be the same length as the Forall type variables.
-    pub fn instantiate_with(
+    pub fn instantiate_with_bindings_and_turbofish(
         &self,
-        types: Vec<Type>,
+        bindings: TypeBindings,
+        turbofish_types: Vec<Type>,
         interner: &NodeInterner,
         implicit_generic_count: usize,
     ) -> (Type, TypeBindings) {
         match self {
             Type::Forall(typevars, typ) => {
                 assert_eq!(
-                    types.len() + implicit_generic_count,
+                    turbofish_types.len() + implicit_generic_count,
                     typevars.len(),
                     "Turbofish operator used with incorrect generic count which was not caught by name resolution"
                 );
 
-                let bindings =
-                    (0..implicit_generic_count).map(|_| interner.next_type_variable()).chain(types);
+                let implicit_and_turbofish_bindings = (0..implicit_generic_count)
+                    .map(|_| interner.next_type_variable())
+                    .chain(turbofish_types);
 
-                let replacements = typevars
+                let mut replacements: TypeBindings = typevars
                     .iter()
-                    .zip(bindings)
+                    .zip(implicit_and_turbofish_bindings)
                     .map(|(var, binding)| (var.id(), (var.clone(), var.kind(), binding)))
                     .collect();
+
+                for (binding_key, binding_value) in bindings {
+                    replacements.insert(binding_key, binding_value);
+                }
 
                 let instantiated = typ.substitute(&replacements);
                 (instantiated, replacements)
@@ -2018,7 +2127,7 @@ impl Type {
         }
 
         let recur_on_binding = |id, replacement: &Type| {
-            // Prevent recuring forever if there's a `T := T` binding
+            // Prevent recurring forever if there's a `T := T` binding
             if replacement.type_variable_id() == Some(id) {
                 replacement.clone()
             } else {
@@ -2104,7 +2213,7 @@ impl Type {
                 Type::Tuple(fields)
             }
             Type::Forall(typevars, typ) => {
-                // Trying to substitute_helper a variable de, substitute_bound_typevarsfined within a nested Forall
+                // Trying to substitute_helper a variable within a nested Forall
                 // is usually impossible and indicative of an error in the type checker somewhere.
                 for var in typevars {
                     assert!(!type_bindings.contains_key(&var.id()));
@@ -2271,7 +2380,7 @@ impl Type {
         }
     }
 
-    /// Follow bindings if this is a type variable or generic to the first non-typevariable
+    /// Follow bindings if this is a type variable or generic to the first non-type-variable
     /// type. Unlike `follow_bindings`, this won't recursively follow any bindings on any
     /// fields or arguments of this type.
     pub fn follow_bindings_shallow(&self) -> Cow<Type> {
@@ -2504,6 +2613,24 @@ impl Type {
             | Type::Error => self,
         }
     }
+
+    pub(crate) fn as_integer_type_suffix(&self) -> Option<IntegerTypeSuffix> {
+        use {IntegerBitSize::*, Signedness::*};
+        match self.follow_bindings_shallow().as_ref() {
+            Type::FieldElement => Some(IntegerTypeSuffix::Field),
+            Type::Integer(Signed, Eight) => Some(IntegerTypeSuffix::I8),
+            Type::Integer(Signed, Sixteen) => Some(IntegerTypeSuffix::I16),
+            Type::Integer(Signed, ThirtyTwo) => Some(IntegerTypeSuffix::I32),
+            Type::Integer(Signed, SixtyFour) => Some(IntegerTypeSuffix::I64),
+            Type::Integer(Unsigned, One) => Some(IntegerTypeSuffix::U1),
+            Type::Integer(Unsigned, Eight) => Some(IntegerTypeSuffix::U8),
+            Type::Integer(Unsigned, Sixteen) => Some(IntegerTypeSuffix::U16),
+            Type::Integer(Unsigned, ThirtyTwo) => Some(IntegerTypeSuffix::U32),
+            Type::Integer(Unsigned, SixtyFour) => Some(IntegerTypeSuffix::U64),
+            Type::Integer(Unsigned, HundredTwentyEight) => Some(IntegerTypeSuffix::U128),
+            _ => None,
+        }
+    }
 }
 
 impl BinaryTypeOperator {
@@ -2679,17 +2806,17 @@ impl std::fmt::Debug for Type {
                 let binding = &var.1;
                 if let TypeBinding::Unbound(_, type_var_kind) = &*binding.borrow() {
                     match type_var_kind {
-                        Kind::Any | Kind::Normal => write!(f, "{:?}", var),
-                        Kind::IntegerOrField => write!(f, "IntOrField{:?}", binding),
-                        Kind::Integer => write!(f, "Int{:?}", binding),
-                        Kind::Numeric(typ) => write!(f, "Numeric({:?}: {:?})", binding, typ),
+                        Kind::Any | Kind::Normal => write!(f, "{var:?}"),
+                        Kind::IntegerOrField => write!(f, "IntOrField{binding:?}"),
+                        Kind::Integer => write!(f, "Int{binding:?}"),
+                        Kind::Numeric(typ) => write!(f, "Numeric({binding:?}: {typ:?})"),
                     }
                 } else {
-                    write!(f, "{}", binding.borrow())
+                    write!(f, "{:?}", binding.borrow())
                 }
             }
             Type::DataType(s, args) => {
-                let args = vecmap(args, |arg| format!("{:?}", arg));
+                let args = vecmap(args, |arg| format!("{arg:?}"));
                 if args.is_empty() {
                     write!(f, "{}", s.borrow())
                 } else {
@@ -2697,16 +2824,16 @@ impl std::fmt::Debug for Type {
                 }
             }
             Type::Alias(alias, args) => {
-                let args = vecmap(args, |arg| format!("{:?}", arg));
+                let args = vecmap(args, |arg| format!("{arg:?}"));
                 if args.is_empty() {
                     write!(f, "{}", alias.borrow())
                 } else {
                     write!(f, "{}<{}>", alias.borrow(), args.join(", "))
                 }
             }
-            Type::TraitAsType(_id, name, generics) => write!(f, "impl {}{:?}", name, generics),
+            Type::TraitAsType(_id, name, generics) => write!(f, "impl {name}{generics:?}"),
             Type::Tuple(elements) => {
-                let elements = vecmap(elements, |arg| format!("{:?}", arg));
+                let elements = vecmap(elements, |arg| format!("{arg:?}"));
                 if elements.len() == 1 {
                     write!(f, "({},)", elements[0])
                 } else {
@@ -2720,18 +2847,18 @@ impl std::fmt::Debug for Type {
             }
             Type::Unit => write!(f, "()"),
             Type::Error => write!(f, "error"),
-            Type::CheckedCast { to, .. } => write!(f, "{:?}", to),
+            Type::CheckedCast { to, .. } => write!(f, "{to:?}"),
             Type::NamedGeneric(NamedGeneric { type_var, name, .. }) => match type_var.kind() {
                 Kind::Any | Kind::Normal | Kind::Integer | Kind::IntegerOrField => {
-                    write!(f, "{}{:?}", name, type_var)
+                    write!(f, "{name}{type_var:?}")
                 }
                 Kind::Numeric(typ) => {
-                    write!(f, "({} : {}){:?}", name, typ, type_var)
+                    write!(f, "({name} : {typ}){type_var:?}")
                 }
             },
-            Type::Constant(x, kind) => write!(f, "({}: {})", x, kind),
+            Type::Constant(x, kind) => write!(f, "({x}: {kind})"),
             Type::Forall(typevars, typ) => {
-                let typevars = vecmap(typevars, |var| format!("{:?}", var));
+                let typevars = vecmap(typevars, |var| format!("{var:?}"));
                 write!(f, "forall {}. {:?}", typevars.join(" "), typ)
             }
             Type::Function(args, ret, env, unconstrained) => {
@@ -2744,7 +2871,7 @@ impl std::fmt::Debug for Type {
                     _ => format!(" with env {env:?}"),
                 };
 
-                let args = vecmap(args.iter(), |arg| format!("{:?}", arg));
+                let args = vecmap(args.iter(), |arg| format!("{arg:?}"));
 
                 write!(f, "fn({}) -> {ret:?}{closure_env_text}", args.join(", "))
             }
@@ -2754,7 +2881,7 @@ impl std::fmt::Debug for Type {
             Type::Reference(element, true) => {
                 write!(f, "&mut {element:?}")
             }
-            Type::Quoted(quoted) => write!(f, "{}", quoted),
+            Type::Quoted(quoted) => write!(f, "{quoted}"),
             Type::InfixExpr(lhs, op, rhs, _) => write!(f, "({lhs:?} {op} {rhs:?})"),
         }
     }
@@ -2813,7 +2940,7 @@ impl std::hash::Hash for Type {
                 len.hash(state);
                 env.hash(state);
             }
-            Type::Tuple(elems) => elems.hash(state),
+            Type::Tuple(elements) => elements.hash(state),
             Type::DataType(def, args) => {
                 def.hash(state);
                 args.hash(state);
