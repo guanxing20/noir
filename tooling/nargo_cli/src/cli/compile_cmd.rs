@@ -1,3 +1,4 @@
+use std::hash::BuildHasher;
 use std::io::{Read, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -218,7 +219,8 @@ fn compile_programs(
 
         // Hash over the entire compiled program, including any post-compile transformations.
         // This is used to detect whether `cached_program` is returned by `compile_program`.
-        let cached_hash = cached_program.as_ref().map(fxhash::hash64);
+        let cached_hash =
+            cached_program.as_ref().map(|prog| rustc_hash::FxBuildHasher.hash_one(prog));
 
         // Compile the program, or use the cached artifacts if it matches.
         let (program, warnings) = compile_program(
@@ -237,16 +239,10 @@ fn compile_programs(
         // If the compiled program is the same as the cached one, we don't apply transformations again, unless the target width has changed.
         // The transformations might not be idempotent, which would risk creating witnesses that don't work with earlier versions,
         // based on which we might have generated a verifier already.
-        if cached_hash == Some(fxhash::hash64(&program)) {
-            let width_matches = program
-                .program
-                .functions
-                .iter()
-                .all(|circuit| circuit.expression_width == target_width);
-
-            if width_matches {
-                return Ok(((), warnings));
-            }
+        if cached_hash == Some(rustc_hash::FxBuildHasher.hash_one(&program))
+            && program.expression_width == target_width
+        {
+            return Ok(((), warnings));
         }
         // Run ACVM optimizations and set the target width.
         let program = nargo::ops::transform_program(program, target_width);
@@ -260,8 +256,13 @@ fn compile_programs(
     };
 
     // Configure a thread pool with a larger stack size to prevent overflowing stack in large programs.
-    // Default is 2MB.
-    let pool = rayon::ThreadPoolBuilder::new().stack_size(4 * 1024 * 1024).build().unwrap();
+    // Default is 2MB. Limit threads to the number of packages we actually need to compile.
+    let num_threads = rayon::current_num_threads().min(binary_packages.len()).max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .stack_size(4 * 1024 * 1024)
+        .build()
+        .unwrap();
     let program_results: Vec<CompilationResult<()>> =
         pool.install(|| binary_packages.par_iter().map(compile_package).collect());
 
@@ -327,6 +328,7 @@ pub(crate) fn get_target_width(
 #[cfg(test)]
 mod tests {
     use std::{
+        hash::BuildHasher,
         path::{Path, PathBuf},
         str::FromStr,
     };
@@ -464,8 +466,9 @@ mod tests {
                 } else {
                     // Just compare hashes, which would just state that the program failed.
                     // Then we can use the filter option to zoom in one one to see why.
-                    assert!(
-                        fxhash::hash64(&program_1) == fxhash::hash64(&program_2),
+                    assert_eq!(
+                        rustc_hash::FxBuildHasher.hash_one(&program_1),
+                        rustc_hash::FxBuildHasher.hash_one(&program_2),
                         "optimization not idempotent for test program '{}'",
                         package.name
                     );

@@ -11,9 +11,11 @@ jobs:
   code:
     name: Code
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Check spelling
         uses: streetsidesoftware/cspell-action@v7
@@ -26,9 +28,11 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Check spelling
         uses: streetsidesoftware/cspell-action@v7

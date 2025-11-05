@@ -1,6 +1,7 @@
 pub mod comptime;
 pub mod def_collector;
 pub mod def_map;
+pub mod printer;
 pub mod resolution;
 pub mod scope;
 pub mod type_check;
@@ -28,7 +29,7 @@ use std::rc::Rc;
 
 use self::def_map::TestFunction;
 
-pub type ParsedFiles = HashMap<fm::FileId, (ParsedModule, Vec<ParserError>)>;
+pub type ParsedFiles = HashMap<FileId, (ParsedModule, Vec<ParserError>)>;
 
 /// Helper object which groups together several useful context objects used
 /// during name resolution. Once name resolution is finished, only the
@@ -47,7 +48,7 @@ pub struct Context<'file_manager, 'parsed_files> {
 
     /// A map of each file that already has been visited from a prior `mod foo;` declaration.
     /// This is used to issue an error if a second `mod foo;` is declared to the same file.
-    pub visited_files: BTreeMap<fm::FileId, Location>,
+    pub visited_files: BTreeMap<FileId, Location>,
 
     // A map of all parsed files.
     // Same as the file manager, we take ownership of the parsed files in the WASM context.

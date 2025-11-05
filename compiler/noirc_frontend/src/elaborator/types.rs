@@ -1,3 +1,5 @@
+//! Type resolution, unification, and method resolution (for both types and traits).
+
 use std::{borrow::Cow, rc::Rc};
 
 use im::HashSet;
@@ -9,9 +11,9 @@ use crate::{
     Generics, Kind, NamedGeneric, ResolvedGeneric, Type, TypeBinding, TypeBindings,
     UnificationError,
     ast::{
-        AsTraitPath, BinaryOpKind, GenericTypeArgs, Ident, IntegerBitSize, PathKind, UnaryOp,
-        UnresolvedGeneric, UnresolvedGenerics, UnresolvedType, UnresolvedTypeData,
-        UnresolvedTypeExpression, WILDCARD_TYPE,
+        AsTraitPath, BinaryOpKind, GenericTypeArgs, Ident, PathKind, UnaryOp, UnresolvedGeneric,
+        UnresolvedGenerics, UnresolvedType, UnresolvedTypeData, UnresolvedTypeExpression,
+        WILDCARD_TYPE,
     },
     elaborator::UnstableFeature,
     hir::{
@@ -104,12 +106,7 @@ impl Elaborator<'_> {
         kind: &Kind,
         wildcard_allowed: bool,
     ) -> Type {
-        self.resolve_type_with_kind_inner(
-            typ,
-            kind,
-            PathResolutionMode::MarkAsReferenced,
-            wildcard_allowed,
-        )
+        self.resolve_type_inner(typ, kind, PathResolutionMode::MarkAsReferenced, wildcard_allowed)
     }
 
     /// Translates an UnresolvedType into a Type and appends any
@@ -668,7 +665,7 @@ impl Elaborator<'_> {
                     return None;
                 };
 
-                let Some(global_value) = global_value.to_field_element() else {
+                let Some(global_value) = global_value.to_signed_field() else {
                     let global_value = global_value.clone();
                     if global_value.is_integral() {
                         self.push_err(ResolverError::NegativeGlobalType { location, global_value });
@@ -682,7 +679,7 @@ impl Elaborator<'_> {
                 };
 
                 let Ok(global_value) = kind.ensure_value_fits(global_value, location) else {
-                    self.push_err(ResolverError::GlobalLargerThanKind {
+                    self.push_err(ResolverError::GlobalDoesNotFitItsType {
                         location,
                         global_value,
                         kind,
@@ -705,14 +702,19 @@ impl Elaborator<'_> {
     ) -> Type {
         match length {
             UnresolvedTypeExpression::Variable(path) => {
+                let mut ab = GenericTypeArgs::default();
+                // Use generics from path, if they exist
+                if let Some(last_segment) = path.segments.last() {
+                    if let Some(generics) = &last_segment.generics {
+                        ab.ordered_args = generics.clone();
+                    }
+                }
                 let path = self.validate_path(path);
                 let mode = PathResolutionMode::MarkAsReferenced;
-                let typ = self.resolve_named_type(
-                    path,
-                    GenericTypeArgs::default(),
-                    mode,
-                    wildcard_allowed,
-                );
+                let mut typ = self.resolve_named_type(path, ab, mode, wildcard_allowed);
+                if let Type::Alias(alias, vec) = typ {
+                    typ = alias.borrow().get_type(&vec);
+                }
                 self.check_kind(typ, expected_kind, location)
             }
             UnresolvedTypeExpression::Constant(int, suffix, _span) => {
@@ -760,7 +762,7 @@ impl Elaborator<'_> {
                     (lhs, rhs) => {
                         let infix = Type::infix_expr(Box::new(lhs), op, Box::new(rhs));
                         Type::CheckedCast { from: Box::new(infix.clone()), to: Box::new(infix) }
-                            .canonicalize(&TypeBindings::default())
+                            .canonicalize()
                     }
                 }
             }
@@ -777,6 +779,10 @@ impl Elaborator<'_> {
         expected_kind: &Kind,
         location: Location,
     ) -> Type {
+        if typ.has_cyclic_alias(&mut HashSet::default()) {
+            self.push_err(TypeCheckError::CyclicType { typ, location });
+            return Type::Error;
+        }
         if !typ.kind().unifies(expected_kind) {
             self.push_err(TypeCheckError::TypeKindMismatch {
                 expected_kind: expected_kind.clone(),
@@ -1116,11 +1122,10 @@ impl Elaborator<'_> {
         if let Type::Reference(element, _mut) = typ.follow_bindings() {
             let location = self.interner.id_location(object);
 
-            let object = self.interner.push_expr(HirExpression::Prefix(HirPrefixExpression {
-                operator: UnaryOp::Dereference { implicitly_added: true },
-                rhs: object,
-                trait_method_id: None,
-            }));
+            let object = self.interner.push_expr(HirExpression::Prefix(HirPrefixExpression::new(
+                UnaryOp::Dereference { implicitly_added: true },
+                object,
+            )));
             self.interner.push_expr_type(object, element.as_ref().clone());
             self.interner.push_expr_location(object, location);
 
@@ -1455,20 +1460,6 @@ impl Elaborator<'_> {
             // Matches on TypeVariable must be first so that we follow any type
             // bindings.
             (TypeVariable(int), other) | (other, TypeVariable(int)) => {
-                if op.kind == BinaryOpKind::ShiftLeft || op.kind == BinaryOpKind::ShiftRight {
-                    self.unify(
-                        rhs_type,
-                        &Type::Integer(Signedness::Unsigned, IntegerBitSize::Eight),
-                        || TypeCheckError::InvalidShiftSize { location },
-                    );
-                    let use_impl = if lhs_type.is_numeric_value() {
-                        let integer_type = self.polymorphic_integer();
-                        self.bind_type_variables_for_infix(lhs_type, op, &integer_type, location)
-                    } else {
-                        true
-                    };
-                    return Ok((lhs_type.clone(), use_impl));
-                }
                 if let TypeBinding::Bound(binding) = &*int.borrow() {
                     return self.infix_operand_type_rules(binding, op, other, location);
                 }
@@ -1476,12 +1467,6 @@ impl Elaborator<'_> {
                 Ok((other.clone(), use_impl))
             }
             (Integer(sign_x, bit_width_x), Integer(sign_y, bit_width_y)) => {
-                if op.kind == BinaryOpKind::ShiftLeft || op.kind == BinaryOpKind::ShiftRight {
-                    if *sign_y != Signedness::Unsigned || *bit_width_y != IntegerBitSize::Eight {
-                        return Err(TypeCheckError::InvalidShiftSize { location });
-                    }
-                    return Ok((Integer(*sign_x, *bit_width_x), false));
-                }
                 if sign_x != sign_y {
                     return Err(TypeCheckError::IntegerSignedness {
                         sign_x: *sign_x,
@@ -1532,12 +1517,6 @@ impl Elaborator<'_> {
             },
 
             (lhs, rhs) => {
-                if op.kind == BinaryOpKind::ShiftLeft || op.kind == BinaryOpKind::ShiftRight {
-                    if rhs == &Type::Integer(Signedness::Unsigned, IntegerBitSize::Eight) {
-                        return Ok((lhs.clone(), true));
-                    }
-                    return Err(TypeCheckError::InvalidShiftSize { location });
-                }
                 self.unify(lhs, rhs, || TypeCheckError::TypeMismatchWithSource {
                     expected: lhs.clone(),
                     actual: rhs.clone(),
@@ -1549,10 +1528,10 @@ impl Elaborator<'_> {
         }
     }
 
-    // Given a unary operator and a type, this method will produce the output type
-    // and a boolean indicating whether to use the trait impl corresponding to the operator
-    // or not. A value of false indicates the caller to use a primitive operation for this
-    // operator, while a true value indicates a user-provided trait impl is required.
+    /// Given a unary operator and a type, this method will produce the output type
+    /// and a boolean indicating whether to use the trait impl corresponding to the operator
+    /// or not. A value of false indicates to the caller to use a primitive operation for this
+    /// operator, while a true value indicates a user-provided trait impl is required.
     pub(super) fn prefix_operand_type_rules(
         &mut self,
         op: &UnaryOp,
@@ -1562,7 +1541,7 @@ impl Elaborator<'_> {
         use Type::*;
 
         match op {
-            crate::ast::UnaryOp::Minus | crate::ast::UnaryOp::Not => {
+            UnaryOp::Minus | UnaryOp::Not => {
                 match rhs_type {
                     // An error type will always return an error
                     Error => Ok((Error, false)),
@@ -1580,7 +1559,7 @@ impl Elaborator<'_> {
 
                         // The `!` prefix operator is not valid for Field, so if this is a numeric
                         // type we constrain it to just (non-Field) integer types.
-                        if matches!(op, crate::ast::UnaryOp::Not) && rhs_type.is_numeric_value() {
+                        if matches!(op, UnaryOp::Not) && rhs_type.is_numeric_value() {
                             let integer_type = Type::polymorphic_integer(self.interner);
                             self.unify(rhs_type, &integer_type, || {
                                 TypeCheckError::InvalidUnaryOp {
@@ -1616,14 +1595,13 @@ impl Elaborator<'_> {
                     _ => Ok((rhs_type.clone(), true)),
                 }
             }
-            crate::ast::UnaryOp::Reference { mutable } => {
-                let typ = Type::Reference(Box::new(rhs_type.follow_bindings()), *mutable);
+            UnaryOp::Reference { mutable } => {
+                let typ = Reference(Box::new(rhs_type.follow_bindings()), *mutable);
                 Ok((typ, false))
             }
-            crate::ast::UnaryOp::Dereference { implicitly_added: _ } => {
+            UnaryOp::Dereference { implicitly_added: _ } => {
                 let element_type = self.interner.next_type_variable();
-                let make_expected =
-                    |mutable| Type::Reference(Box::new(element_type.clone()), mutable);
+                let make_expected = |mutable| Reference(Box::new(element_type.clone()), mutable);
 
                 let immutable = make_expected(false);
                 let mutable = make_expected(true);
@@ -1708,11 +1686,10 @@ impl Elaborator<'_> {
 
         let dereference_lhs = |this: &mut Self, lhs_type, element| {
             let old_lhs = *access_lhs;
-            *access_lhs = this.interner.push_expr(HirExpression::Prefix(HirPrefixExpression {
-                operator: crate::ast::UnaryOp::Dereference { implicitly_added: true },
-                rhs: old_lhs,
-                trait_method_id: None,
-            }));
+            *access_lhs = this.interner.push_expr(HirExpression::Prefix(HirPrefixExpression::new(
+                UnaryOp::Dereference { implicitly_added: true },
+                old_lhs,
+            )));
             this.interner.push_expr_type(old_lhs, lhs_type);
             this.interner.push_expr_type(*access_lhs, element);
 
@@ -2101,9 +2078,10 @@ impl Elaborator<'_> {
                     self.push_err(TypeCheckError::Unsafe { location });
                 }
                 UnsafeBlockStatus::InUnsafeBlockWithoutUnconstrainedCalls => {
-                    self.unsafe_block_status = UnsafeBlockStatus::InUnsafeBlockWithConstrainedCalls;
+                    self.unsafe_block_status =
+                        UnsafeBlockStatus::InUnsafeBlockWithUnconstrainedCalls;
                 }
-                UnsafeBlockStatus::InUnsafeBlockWithConstrainedCalls => (),
+                UnsafeBlockStatus::InUnsafeBlockWithUnconstrainedCalls => (),
             }
 
             if let Some(called_func_id) = self.interner.lookup_function_from_expr(&call.func) {
@@ -2186,12 +2164,9 @@ impl Elaborator<'_> {
 
                     // If that didn't work, then wrap the whole expression in an `&mut`
                     *object = new_object.unwrap_or_else(|| {
-                        let new_object =
-                            self.interner.push_expr(HirExpression::Prefix(HirPrefixExpression {
-                                operator: UnaryOp::Reference { mutable },
-                                rhs: *object,
-                                trait_method_id: None,
-                            }));
+                        let new_object = self.interner.push_expr(HirExpression::Prefix(
+                            HirPrefixExpression::new(UnaryOp::Reference { mutable }, *object),
+                        ));
                         self.interner.push_expr_type(new_object, new_type);
                         self.interner.push_expr_location(new_object, location);
                         new_object
@@ -2255,7 +2230,7 @@ impl Elaborator<'_> {
         }
     }
 
-    fn function_info(&self, function_body_id: ExprId) -> (noirc_errors::Location, bool) {
+    fn function_info(&self, function_body_id: ExprId) -> (Location, bool) {
         let (expr_location, empty_function) =
             if let HirExpression::Block(block) = self.interner.expression(&function_body_id) {
                 let last_stmt = block.statements().last();

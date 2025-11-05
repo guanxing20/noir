@@ -1,6 +1,5 @@
 use std::{borrow::Cow, rc::Rc, vec};
 
-use acvm::FieldElement;
 use im::Vector;
 use iter_extended::{try_vecmap, vecmap};
 use noirc_errors::Location;
@@ -85,7 +84,7 @@ pub enum Value {
     UnresolvedType(UnresolvedTypeData),
 }
 
-pub type StructFields = HashMap<Rc<String>, Shared<Value>>;
+pub(super) type StructFields = HashMap<Rc<String>, Shared<Value>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Closure {
@@ -215,11 +214,11 @@ impl Value {
                 Some(IntegerTypeSuffix::U1),
             )),
             Value::U8(value) => ExpressionKind::Literal(Literal::Integer(
-                SignedField::positive(value as u128),
+                SignedField::positive(u128::from(value)),
                 Some(IntegerTypeSuffix::U8),
             )),
             Value::U16(value) => ExpressionKind::Literal(Literal::Integer(
-                SignedField::positive(value as u128),
+                SignedField::positive(u128::from(value)),
                 Some(IntegerTypeSuffix::U16),
             )),
             Value::U32(value) => ExpressionKind::Literal(Literal::Integer(
@@ -368,7 +367,6 @@ impl Value {
         location: Location,
     ) -> IResult<ExprId> {
         let typ = self.get_type().into_owned();
-
         let expression = match self {
             Value::Unit => HirExpression::Literal(HirLiteral::Unit),
             Value::Bool(value) => HirExpression::Literal(HirLiteral::Bool(value)),
@@ -388,12 +386,12 @@ impl Value {
             Value::U1(value) => {
                 HirExpression::Literal(HirLiteral::Integer(SignedField::positive(value)))
             }
-            Value::U8(value) => {
-                HirExpression::Literal(HirLiteral::Integer(SignedField::positive(value as u128)))
-            }
-            Value::U16(value) => {
-                HirExpression::Literal(HirLiteral::Integer(SignedField::positive(value as u128)))
-            }
+            Value::U8(value) => HirExpression::Literal(HirLiteral::Integer(SignedField::positive(
+                u128::from(value),
+            ))),
+            Value::U16(value) => HirExpression::Literal(HirLiteral::Integer(
+                SignedField::positive(u128::from(value)),
+            )),
             Value::U32(value) => {
                 HirExpression::Literal(HirLiteral::Integer(SignedField::positive(value)))
             }
@@ -541,18 +539,18 @@ impl Value {
             }
             Value::TypedExpr(TypedExpr::ExprId(expr_id)) => vec![Token::UnquoteMarker(expr_id)],
             Value::Bool(bool) => vec![Token::Bool(bool)],
-            Value::U1(bool) => vec![Token::Int((bool as u128).into(), None)],
+            Value::U1(bool) => vec![Token::Int(u128::from(bool).into(), None)],
             Value::U8(value) => {
-                vec![Token::Int((value as u128).into(), None)]
+                vec![Token::Int(u128::from(value).into(), None)]
             }
             Value::U16(value) => {
-                vec![Token::Int((value as u128).into(), None)]
+                vec![Token::Int(u128::from(value).into(), None)]
             }
             Value::U32(value) => {
-                vec![Token::Int((value as u128).into(), None)]
+                vec![Token::Int(u128::from(value).into(), None)]
             }
             Value::U64(value) => {
-                vec![Token::Int((value as u128).into(), None)]
+                vec![Token::Int(u128::from(value).into(), None)]
             }
             Value::U128(value) => vec![Token::Int(value.into(), None)],
             Value::I8(value) => {
@@ -615,6 +613,24 @@ impl Value {
         )
     }
 
+    pub(crate) fn is_zero(&self) -> bool {
+        use Value::*;
+        match self {
+            Field(value) => value.is_zero(),
+            I8(value) => *value == 0,
+            I16(value) => *value == 0,
+            I32(value) => *value == 0,
+            I64(value) => *value == 0,
+            U1(value) => !*value,
+            U8(value) => *value == 0,
+            U16(value) => *value == 0,
+            U32(value) => *value == 0,
+            U64(value) => *value == 0,
+            U128(value) => *value == 0,
+            _ => false,
+        }
+    }
+
     pub(crate) fn contains_function_or_closure(&self) -> bool {
         match self {
             Value::Function(..) => true,
@@ -666,27 +682,21 @@ impl Value {
         }
     }
 
-    /// Converts any non-negative `Value` into a `FieldElement`.
-    /// Returns `None` for negative integers and non-integral `Value`s.
-    pub(crate) fn to_field_element(&self) -> Option<FieldElement> {
+    /// Converts any integral `Value` into a `SignedField`.
+    /// Returns `None` for non-integral `Value`s.
+    pub(crate) fn to_signed_field(&self) -> Option<SignedField> {
         match self {
-            Self::Field(value) => {
-                if value.is_negative() {
-                    None
-                } else {
-                    Some(value.absolute_value())
-                }
-            }
+            Self::Field(value) => Some(*value),
 
             Self::I8(value) => (*value >= 0).then_some((*value as u128).into()),
             Self::I16(value) => (*value >= 0).then_some((*value as u128).into()),
             Self::I32(value) => (*value >= 0).then_some((*value as u128).into()),
             Self::I64(value) => (*value >= 0).then_some((*value as u128).into()),
-            Self::U1(value) => Some(FieldElement::from(*value)),
-            Self::U8(value) => Some((*value as u128).into()),
-            Self::U16(value) => Some((*value as u128).into()),
-            Self::U32(value) => Some((*value as u128).into()),
-            Self::U64(value) => Some((*value as u128).into()),
+            Self::U1(value) => Some(if *value { SignedField::one() } else { SignedField::zero() }),
+            Self::U8(value) => Some(u128::from(*value).into()),
+            Self::U16(value) => Some(u128::from(*value).into()),
+            Self::U32(value) => Some(u128::from(*value).into()),
+            Self::U64(value) => Some(u128::from(*value).into()),
             Self::U128(value) => Some((*value).into()),
             _ => None,
         }
@@ -720,16 +730,17 @@ impl Value {
         }
     }
 
-    /// Copies an argument ensuring any references to struct/tuple fields are replaced with fresh ones.
-    pub(crate) fn copy(self) -> Value {
+    /// Structs and tuples store references to their fields internally which need to be manually
+    /// changed when moving them.
+    pub(crate) fn move_struct(self) -> Value {
         match self {
-            Value::Tuple(fields) => {
-                Value::Tuple(vecmap(fields, |field| Shared::new(field.unwrap_or_clone().copy())))
-            }
+            Value::Tuple(fields) => Value::Tuple(vecmap(fields, |field| {
+                Shared::new(field.unwrap_or_clone().move_struct())
+            })),
             Value::Struct(fields, typ) => {
-                let fields = fields
-                    .into_iter()
-                    .map(|(name, field)| (name, Shared::new(field.unwrap_or_clone().copy())));
+                let fields = fields.into_iter().map(|(name, field)| {
+                    (name, Shared::new(field.unwrap_or_clone().move_struct()))
+                });
                 Value::Struct(fields.collect(), typ)
             }
             other => other,

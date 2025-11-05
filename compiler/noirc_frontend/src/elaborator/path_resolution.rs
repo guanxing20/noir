@@ -1,3 +1,5 @@
+//! Path resolution for types, values, and trait methods across modules.
+
 use iter_extended::vecmap;
 use noirc_errors::{Located, Location, Span};
 
@@ -468,7 +470,11 @@ impl Elaborator<'_> {
             });
         }
 
-        let plain_or_crate = matches!(path.kind, PathKind::Plain | PathKind::Crate);
+        let first_segment_is_always_visible = match path.kind {
+            PathKind::Crate => true,
+            PathKind::Plain => importing_module == starting_module,
+            PathKind::Dep | PathKind::Super | PathKind::Resolved(_) => false,
+        };
 
         // The current module and module ID as we resolve path segments
         let mut current_module_id = starting_module;
@@ -551,7 +557,7 @@ impl Elaborator<'_> {
 
             // If the path is plain or crate, the first segment will always refer to
             // something that's visible from the current module.
-            if !((plain_or_crate && index == 0)
+            if !((first_segment_is_always_visible && index == 0)
                 || item_in_module_is_visible(
                     self.def_maps,
                     importing_module,

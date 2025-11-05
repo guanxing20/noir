@@ -1,18 +1,17 @@
+//! Statement elaboration including let bindings, assignments, and control flow.
+
 use noirc_errors::Location;
 
 use crate::{
-    DataType, Type,
+    Type,
     ast::{
-        AssignStatement, Expression, ForLoopStatement, ForRange, Ident, IntegerBitSize,
-        ItemVisibility, LValue, LetStatement, Statement, StatementKind, WhileStatement,
+        AssignStatement, Expression, ForLoopStatement, ForRange, IntegerBitSize, LValue,
+        LetStatement, Statement, StatementKind, WhileStatement,
     },
     elaborator::PathResolutionTarget,
     hir::{
         def_collector::dc_crate::CompilationError,
-        resolution::{
-            errors::ResolverError, import::PathResolutionError,
-            visibility::struct_member_is_visible,
-        },
+        resolution::errors::ResolverError,
         type_check::{Source, TypeCheckError},
     },
     hir_def::{
@@ -82,7 +81,8 @@ impl Elaborator<'_> {
     }
 
     pub(super) fn elaborate_local_let(&mut self, let_stmt: LetStatement) -> (HirStatement, Type) {
-        self.elaborate_let(let_stmt, None)
+        let (let_statement, typ) = self.elaborate_let(let_stmt, None);
+        (HirStatement::Let(let_statement), typ)
     }
 
     /// Elaborate a local or global let statement.
@@ -93,7 +93,7 @@ impl Elaborator<'_> {
         &mut self,
         let_stmt: LetStatement,
         global_id: Option<GlobalId>,
-    ) -> (HirStatement, Type) {
+    ) -> (HirLetStatement, Type) {
         let type_contains_unspecified = let_stmt.r#type.contains_unspecified();
         let annotated_type = self.resolve_inferred_type(let_stmt.r#type);
 
@@ -145,7 +145,7 @@ impl Elaborator<'_> {
         let is_global_let = let_stmt.is_global_let;
         let let_ =
             HirLetStatement::new(pattern, r#type, expression, attributes, comptime, is_global_let);
-        (HirStatement::Let(let_), Type::Unit)
+        (let_, Type::Unit)
     }
 
     pub(super) fn elaborate_assign(&mut self, assign: AssignStatement) -> (HirStatement, Type) {
@@ -679,24 +679,6 @@ impl Elaborator<'_> {
         }
 
         None
-    }
-
-    pub(super) fn check_struct_field_visibility(
-        &mut self,
-        struct_type: &DataType,
-        field_name: &str,
-        visibility: ItemVisibility,
-        location: Location,
-    ) {
-        if self.silence_field_visibility_errors > 0 {
-            return;
-        }
-
-        if !struct_member_is_visible(struct_type.id, visibility, self.module_id(), self.def_maps) {
-            self.push_err(ResolverError::PathResolutionError(PathResolutionError::Private(
-                Ident::new(field_name.to_string(), location),
-            )));
-        }
     }
 
     fn elaborate_comptime_statement(&mut self, statement: Statement) -> (HirStatement, Type) {

@@ -73,6 +73,10 @@ impl<'a> Lexer<'a> {
         self
     }
 
+    pub fn set_skip_whitespaces_flag(&mut self, flag: bool) {
+        self.skip_whitespaces = flag;
+    }
+
     /// Iterates the cursor and returns the char at the new cursor position
     fn next_char(&mut self) -> Option<char> {
         let (position, ch) = self.chars.next()?;
@@ -1476,7 +1480,7 @@ mod tests {
         //
         // let source = std::str::from_utf8(..).unwrap().to_string();
         let s: Cow<'_, str> = match std::str::from_utf8(&base64_decoded) {
-            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Ok(s) => Cow::Borrowed(s),
             Err(_err) => {
                 // recover as much of the string as possible
                 // when str::from_utf8 fails

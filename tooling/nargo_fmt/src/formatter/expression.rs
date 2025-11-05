@@ -966,6 +966,7 @@ impl ChunkFormatter<'_, '_> {
 
             // Add a trailing comma regardless of whether the user specified one or not
             group.text(self.chunk(|formatter| {
+                formatter.skip_comments_and_whitespace();
                 if formatter.token == Token::Comma {
                     formatter.write_current_token_and_bump();
                 } else {
@@ -2486,7 +2487,7 @@ global y = 1;
 
     #[test]
     fn format_match() {
-        let src = "fn main() {  match  x  {  A=>B,C  =>  {D}E=>(),  } }";
+        let src = "fn main() {  match  x  {  A=>B  ,  C  =>  {D}E=>()  ,  } }";
         // We should remove the block on D for single expressions in the future,
         // unless D is an if or match.
         let expected = "fn main() {
@@ -2627,5 +2628,17 @@ global y = 1;
 }
 "#;
         assert_format_with_max_width(src, src, 40);
+    }
+
+    #[test]
+    fn regression_9556() {
+        let src = r#"fn foo() {
+    let x = a()
+        .bcde(fghijk
+            );
+    x
+}
+"#;
+        assert_format_with_max_width(src, src, 20);
     }
 }

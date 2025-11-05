@@ -17,7 +17,6 @@ use crate::hir_def::expr::{
 use crate::hir_def::stmt::{HirLValue, HirPattern, HirStatement};
 use crate::hir_def::types::{Type, TypeBinding};
 use crate::node_interner::{DefinitionId, ExprId, NodeInterner, StmtId};
-use crate::signed_field::SignedField;
 
 // TODO:
 // - Full path for idents & types
@@ -463,7 +462,13 @@ impl Type {
             // Since there is no UnresolvedTypeData equivalent for Type::Forall, we use
             // this to ignore this case since it shouldn't be needed anyway.
             Type::Forall(_, typ) => return typ.to_display_ast(),
-            Type::Constant(..) => panic!("Type::Constant where a type was expected: {self:?}"),
+            Type::Constant(value, kind) => {
+                UnresolvedTypeData::Expression(UnresolvedTypeExpression::Constant(
+                    *value,
+                    kind.as_integer_type_suffix(),
+                    Location::dummy(),
+                ))
+            }
             Type::Quoted(quoted_type) => {
                 UnresolvedTypeData::quoted(*quoted_type, Location::dummy())
             }
@@ -534,7 +539,7 @@ impl HirArrayLiteral {
                 let length = match length {
                     Type::Constant(length, kind) => {
                         let suffix = kind.as_integer_type_suffix();
-                        let literal = Literal::Integer(SignedField::positive(*length), suffix);
+                        let literal = Literal::Integer(*length, suffix);
                         let expr_kind = ExpressionKind::Literal(literal);
                         Box::new(Expression::new(expr_kind, location))
                     }

@@ -54,7 +54,7 @@ All data types in Noir are private by default. Types are explicitly declared as 
 `pub` modifier:
 
 ```rust
-fn main(x : Field, y : pub Field) -> pub Field {
+fn main(x: u32, y: pub u32) -> pub u32 {
     x + y
 }
 ```
@@ -111,6 +111,34 @@ to make the type alias public or `pub(crate)` to make it public to just its crat
 ```rust
 // This type alias is now public
 pub type Id = u8;
+```
+
+### Numeric type aliases
+
+Type aliases can also be defined for numeric types, which can help cut down on longer type expressions.
+
+```rust
+type Double<let N: u32>: u32 = N * 2;
+
+// When used in an array position we need to use the turbofish operator to specify any
+// generics in a numeric type alias
+fn concat_self<let N: u32>(array: [u32; N]) -> [u32; Double::<N>] {
+    let mut result = [0; Double::<N>];
+    for i in 0..array.len() {
+        result[i] = array[i];
+        result[i + array.len()] = array[i];
+    }
+    result
+}
+
+struct Array<T, let N: u32> {
+    data: [T; N],
+}
+
+// When used within other type positions, however, we can refer to it without the `::`
+fn concat_self2<let N: u32>(array: Array<u32, N>) -> Array<u32, Double<N>> {
+    Array { data: concat_self(array.data) }
+}
 ```
 
 ## Wildcard Type

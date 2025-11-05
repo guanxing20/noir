@@ -33,7 +33,7 @@ use crate::{
             value::{ExprValue, TypedExpr},
         },
         def_collector::dc_crate::CollectedItems,
-        def_map::ModuleDefId,
+        def_map::{ModuleDefId, ModuleId},
         type_check::generics::TraitGenerics,
     },
     hir_def::{
@@ -154,13 +154,16 @@ impl Interpreter<'_, '_> {
             "function_def_set_unconstrained" => {
                 function_def_set_unconstrained(self, arguments, location)
             }
+            "function_def_visibility" => function_def_visibility(interner, arguments, location),
             "module_add_item" => module_add_item(self, arguments, location),
+            "module_child_modules" => module_child_modules(self, arguments, location),
             "module_eq" => module_eq(arguments, location),
             "module_functions" => module_functions(self, arguments, location),
             "module_has_named_attribute" => module_has_named_attribute(self, arguments, location),
             "module_hash" => module_hash(arguments, location),
             "module_is_contract" => module_is_contract(self, arguments, location),
             "module_name" => module_name(interner, arguments, location),
+            "module_parent" => module_parent(self, arguments, return_type, location),
             "module_structs" => module_structs(self, arguments, location),
             "modulus_be_bits" => modulus_be_bits(arguments, location),
             "modulus_be_bytes" => modulus_be_bytes(arguments, location),
@@ -212,6 +215,9 @@ impl Interpreter<'_, '_> {
             "type_def_add_attribute" => type_def_add_attribute(interner, arguments, location),
             "type_def_add_generic" => type_def_add_generic(interner, arguments, location),
             "type_def_as_type" => type_def_as_type(interner, arguments, location),
+            "type_def_as_type_with_generics" => {
+                type_def_as_type_with_generics(interner, arguments, return_type, location)
+            }
             "type_def_eq" => type_def_eq(arguments, location),
             "type_def_fields" => type_def_fields(interner, arguments, location, call_stack),
             "type_def_fields_as_written" => {
@@ -262,7 +268,7 @@ impl Interpreter<'_, '_> {
 fn failing_constraint<T>(
     message: impl Into<String>,
     location: Location,
-    call_stack: &im::Vector<Location>,
+    call_stack: &Vector<Location>,
 ) -> IResult<T> {
     Err(InterpreterError::FailingConstraint {
         message: Some(message.into()),
@@ -337,7 +343,7 @@ fn static_assert(
     interner: &NodeInterner,
     arguments: Vec<(Value, Location)>,
     location: Location,
-    call_stack: &im::Vector<Location>,
+    call_stack: &Vector<Location>,
 ) -> IResult<Value> {
     let (predicate, message) = check_two_arguments(arguments, location)?;
     let predicate = get_bool(predicate)?;
@@ -358,7 +364,7 @@ fn str_as_bytes(
     let string = check_one_argument(arguments, location)?;
     let string = get_str(interner, string)?;
 
-    let bytes: im::Vector<Value> = string.bytes().map(Value::U8).collect();
+    let bytes: Vector<Value> = string.bytes().map(Value::U8).collect();
     let byte_array_type = byte_array_type(bytes.len());
     Ok(Value::Array(bytes, byte_array_type))
 }
@@ -471,6 +477,31 @@ fn type_def_as_type(
     Ok(Value::Type(Type::DataType(type_def_rc, generics)))
 }
 
+/// `fn as_type_with_generics(self, generics: [Type]) -> Option<Type>`
+fn type_def_as_type_with_generics(
+    interner: &NodeInterner,
+    arguments: Vec<(Value, Location)>,
+    return_type: Type,
+    location: Location,
+) -> IResult<Value> {
+    let (type_def, generics) = check_two_arguments(arguments, location)?;
+    let type_id = get_type_id(type_def)?;
+    let type_def_rc = interner.get_type(type_id);
+    let type_def = type_def_rc.borrow();
+
+    let generics_location = generics.1;
+    let (generics, _) = get_slice(interner, generics)?;
+    let generics = try_vecmap(generics, |generic| get_type((generic, generics_location)))?;
+
+    let correct_generic_count = type_def.generics.len() == generics.len();
+    drop(type_def);
+
+    let type_result =
+        correct_generic_count.then(|| Value::Type(Type::DataType(type_def_rc, generics)));
+
+    Ok(option(return_type, type_result, location))
+}
+
 /// fn generics(self) -> [(Type, `Option<Type>`)]
 fn type_def_generics(
     interner: &NodeInterner,
@@ -546,7 +577,7 @@ fn type_def_fields(
     interner: &mut NodeInterner,
     arguments: Vec<(Value, Location)>,
     location: Location,
-    call_stack: &im::Vector<Location>,
+    call_stack: &Vector<Location>,
 ) -> IResult<Value> {
     let (typ, generic_args) = check_two_arguments(arguments, location)?;
     let struct_id = get_type_id(typ)?;
@@ -571,7 +602,7 @@ fn type_def_fields(
         return Err(InterpreterError::FailingConstraint { message, location, call_stack });
     }
 
-    let mut fields = im::Vector::new();
+    let mut fields = Vector::new();
 
     if let Some(struct_fields) = struct_def.get_fields(&generic_args) {
         for (field_name, field_type, visibility) in struct_fields {
@@ -605,7 +636,7 @@ fn type_def_fields_as_written(
     let struct_def = interner.get_type(struct_id);
     let struct_def = struct_def.borrow();
 
-    let mut fields = im::Vector::new();
+    let mut fields = Vector::new();
 
     if let Some(struct_fields) = struct_def.get_fields_as_written() {
         for field in struct_fields {
@@ -726,7 +757,7 @@ fn slice_remove(
     interner: &mut NodeInterner,
     arguments: Vec<(Value, Location)>,
     location: Location,
-    call_stack: &im::Vector<Location>,
+    call_stack: &Vector<Location>,
 ) -> IResult<Value> {
     let (slice, index) = check_two_arguments(arguments, location)?;
 
@@ -765,7 +796,7 @@ fn slice_pop_front(
     interner: &mut NodeInterner,
     arguments: Vec<(Value, Location)>,
     location: Location,
-    call_stack: &im::Vector<Location>,
+    call_stack: &Vector<Location>,
 ) -> IResult<Value> {
     let argument = check_one_argument(arguments, location)?;
 
@@ -782,7 +813,7 @@ fn slice_pop_back(
     interner: &mut NodeInterner,
     arguments: Vec<(Value, Location)>,
     location: Location,
-    call_stack: &im::Vector<Location>,
+    call_stack: &Vector<Location>,
 ) -> IResult<Value> {
     let argument = check_one_argument(arguments, location)?;
 
@@ -962,7 +993,7 @@ fn to_le_radix(
     let (limb_count, element_type) = if let Type::Array(length, element_type) = return_type {
         if let Type::Constant(limb_count, kind) = *length {
             if kind.unifies(&Kind::u32()) {
-                (limb_count, element_type)
+                (limb_count.to_field_element(), element_type)
             } else {
                 return Err(InterpreterError::TypeAnnotationsNeededForMethodCall { location });
             }
@@ -1470,7 +1501,7 @@ fn zeroed(return_type: Type, location: Location) -> Value {
                 Value::Zeroed(Type::Array(length_type, elem))
             }
         }
-        Type::Slice(_) => Value::Slice(im::Vector::new(), return_type),
+        Type::Slice(_) => Value::Slice(Vector::new(), return_type),
         Type::Integer(sign, bits) => match (sign, bits) {
             (Signedness::Unsigned, IntegerBitSize::One) => Value::U8(0),
             (Signedness::Unsigned, IntegerBitSize::Eight) => Value::U8(0),
@@ -2097,7 +2128,7 @@ fn expr_as_member_access(
                 Shared::new(quote_ident(&member_access.rhs, location)),
             ]))
         }
-        ExprValue::LValue(crate::ast::LValue::MemberAccess { object, field_name, location: _ }) => {
+        ExprValue::LValue(LValue::MemberAccess { object, field_name, location: _ }) => {
             Some(Value::Tuple(vec![
                 Shared::new(Value::lvalue(*object)),
                 Shared::new(quote_ident(&field_name, location)),
@@ -2830,6 +2861,18 @@ fn function_def_set_unconstrained(
     Ok(Value::Unit)
 }
 
+// fn visibility(self) -> Quoted
+fn function_def_visibility(
+    interner: &NodeInterner,
+    arguments: Vec<(Value, Location)>,
+    location: Location,
+) -> IResult<Value> {
+    let self_argument = check_one_argument(arguments, location)?;
+    let func_id = get_function_def(self_argument)?;
+    let visibility = interner.function_visibility(func_id);
+    Ok(visibility_to_quoted(visibility, location))
+}
+
 // fn add_item(self, item: Quoted)
 fn module_add_item(
     interpreter: &mut Interpreter,
@@ -2846,9 +2889,7 @@ fn module_add_item(
     interpreter.elaborate_in_module(module_id, reason, |elaborator| {
         let mut generated_items = CollectedItems::default();
 
-        for top_level_statement in top_level_statements {
-            elaborator.add_item(top_level_statement, &mut generated_items, location);
-        }
+        elaborator.add_items(top_level_statements, &mut generated_items, location);
 
         if !generated_items.is_empty() {
             elaborator.elaborate_items(generated_items);
@@ -2856,6 +2897,27 @@ fn module_add_item(
     });
 
     Ok(Value::Unit)
+}
+
+// fn child_modules(self) -> [Module]
+fn module_child_modules(
+    interpreter: &Interpreter,
+    arguments: Vec<(Value, Location)>,
+    location: Location,
+) -> IResult<Value> {
+    let self_argument = check_one_argument(arguments, location)?;
+    let module_id = get_module(self_argument)?;
+    let module_data = interpreter.elaborator.get_module(module_id);
+
+    let children = module_data
+        .child_declaration_order
+        .iter()
+        .copied()
+        .map(|local_id| Value::ModuleDefinition(ModuleId { local_id, krate: module_id.krate }))
+        .collect();
+
+    let slice_type = Type::Slice(Box::new(Type::Quoted(QuotedType::Module)));
+    Ok(Value::Slice(children, slice_type))
 }
 
 fn module_hash(arguments: Vec<(Value, Location)>, location: Location) -> IResult<Value> {
@@ -2890,6 +2952,24 @@ fn module_functions(
 
     let slice_type = Type::Slice(Box::new(Type::Quoted(QuotedType::FunctionDefinition)));
     Ok(Value::Slice(func_ids, slice_type))
+}
+
+// fn parent(self) -> Option<Module>
+fn module_parent(
+    interpreter: &Interpreter,
+    arguments: Vec<(Value, Location)>,
+    return_type: Type,
+    location: Location,
+) -> IResult<Value> {
+    let self_argument = check_one_argument(arguments, location)?;
+    let module_id = get_module(self_argument)?;
+    let module_data = interpreter.elaborator.get_module(module_id);
+
+    let value = module_data.parent.map(|local_id| {
+        let id = ModuleId { krate: module_id.krate, local_id };
+        Value::ModuleDefinition(id)
+    });
+    Ok(option(return_type, value, location))
 }
 
 // fn structs(self) -> [TypeDefinition]

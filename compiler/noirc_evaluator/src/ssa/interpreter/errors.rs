@@ -9,7 +9,7 @@ use thiserror::Error;
 
 pub(super) const MAX_UNSIGNED_BIT_SIZE: u32 = 128;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum InterpreterError {
     /// These errors are all the result from malformed input SSA
     #[error("{0}")]
@@ -69,11 +69,11 @@ pub enum InterpreterError {
     #[error("Reached the unreachable")]
     ReachedTheUnreachable,
     #[error("Array index {index} is out of bounds for array of length {length}")]
-    IndexOutOfBounds { index: u32, length: u32 },
+    IndexOutOfBounds { index: FieldElement, length: u32 },
 }
 
 /// These errors can only result from interpreting malformed SSA
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum InternalError {
     #[error(
         "Argument count {arguments} to block {block} does not match the expected parameter count {parameters}"
@@ -115,8 +115,6 @@ pub enum InternalError {
         "Invalid bit size of `{bit_size}` given to truncate, maximum size allowed for unsigned values is {MAX_UNSIGNED_BIT_SIZE}"
     )]
     InvalidUnsignedTruncateBitSize { bit_size: u32 },
-    #[error("Rhs of `{operator}` should be a u8 but found `{rhs_id} = {rhs}`")]
-    RhsOfBitShiftShouldBeU8 { operator: &'static str, rhs_id: ValueId, rhs: String },
     #[error(
         "Expected {expected_type} value in {instruction} but instead found `{value_id} = {value}`"
     )]

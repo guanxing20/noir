@@ -299,7 +299,7 @@ pub struct ModuleDeclaration {
     pub has_semicolon: bool,
 }
 
-impl std::fmt::Display for ModuleDeclaration {
+impl Display for ModuleDeclaration {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "mod {}", self.ident)
     }
@@ -476,6 +476,16 @@ impl Path {
         self.kind == PathKind::Plain
             && self.segments.len() == 1
             && self.segments.first().unwrap().generics.is_none()
+    }
+
+    pub fn no_generic(&self) -> bool {
+        for segment in &self.segments {
+            if segment.generics.is_some() {
+                return false;
+            }
+        }
+
+        true
     }
 
     pub fn as_ident(&self) -> Option<&Ident> {

@@ -13,7 +13,7 @@ use completion_items::{
     trait_impl_method_completion_item,
 };
 use convert_case::{Case, Casing};
-use fm::{FileId, FileMap, PathString};
+use fm::{FileId, FileMap};
 use iter_extended::vecmap;
 use kinds::{FunctionCompletionKind, FunctionKind, RequestedItems};
 use noirc_errors::{Location, Span};
@@ -63,16 +63,9 @@ pub(crate) fn on_completion_request(
     state: &mut LspState,
     params: CompletionParams,
 ) -> impl Future<Output = Result<Option<CompletionResponse>, ResponseError>> + use<> {
-    let uri = params.text_document_position.clone().text_document.uri;
-
     let result = process_request(state, params.text_document_position.clone(), |args| {
-        let path = PathString::from_path(uri.to_file_path().unwrap());
-        args.files.get_file_id(&path).and_then(|file_id| {
-            utils::position_to_byte_index(
-                args.files,
-                file_id,
-                &params.text_document_position.position,
-            )
+        let file_id = args.location.file;
+        utils::position_to_byte_index(args.files, file_id, &params.text_document_position.position)
             .and_then(|byte_index| {
                 let file = args.files.get_file(file_id).unwrap();
                 let source = file.source();
@@ -92,7 +85,6 @@ pub(crate) fn on_completion_request(
                 );
                 finder.find(&parsed_module)
             })
-        })
     });
     future::ready(result)
 }
@@ -740,6 +732,7 @@ impl<'a> NodeFinder<'a> {
 
                 if is_primitive
                     && !method_call_is_visible(
+                        self.self_type.as_ref(),
                         typ,
                         func_id,
                         self.module_id,
@@ -1010,7 +1003,7 @@ impl<'a> NodeFinder<'a> {
     fn resolve_path(&self, segments: Vec<Ident>) -> Option<ModuleDefId> {
         let last_segment = segments.last().unwrap().clone();
 
-        // If we can't resolve a path trough lookup, let's see if the last segment is bound to a type
+        // If we can't resolve a path through lookup, let's see if the last segment is bound to a type
         let location = Location::new(last_segment.span(), self.file);
         if let Some(reference_id) = self.interner.find_referenced(location) {
             if let Some(id) = module_def_id_from_reference_id(reference_id) {
